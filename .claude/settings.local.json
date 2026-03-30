@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(flutter pub:*)",
+      "Bash(flutter analyze:*)",
+      "Bash(dart analyze:*)",
+      "Bash(find ~/.pub-cache -name types.dart -path */realtime_client*)",
+      "Bash(find ~/.pub-cache -name *.dart -path *supabase*presence*)"
+    ]
+  }
+}
