@@ -1,124 +1,166 @@
-from datetime import datetime, timezone
+"""
+Task Router — /tasks prefix
+All endpoints require authentication + household membership.
+WebSocket broadcasts happen inside the service layer on every mutation.
+"""
 
-from fastapi import APIRouter, HTTPException, status
+from typing import Optional
 
-from ..auth import CurrentUser
-from ..database import get_supabase
-from ..models.task import CreateTaskRequest, TaskResponse, UpdateTaskRequest
-from ..services.fcm_service import send_push_to_user
+from fastapi import APIRouter, Depends, Query
+
+from app.core.dependencies import require_household
+from app.schemas.common import MessageResponse, SuccessResponse
+from app.schemas.tasks import (
+    CreateSubtaskRequest,
+    CreateTaskRequest,
+    SubtaskResponse,
+    TaskListResponse,
+    TaskResponse,
+    UpdateSubtaskRequest,
+    UpdateTaskRequest,
+)
+from app.services.task_service import TaskService
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 
 
-def _assert_member(db, household_id: str, user_id: str):
-    result = (
-        db.table("household_members")
-        .select("id")
-        .eq("household_id", household_id)
-        .eq("user_id", user_id)
-        .maybe_single()
-        .execute()
+@router.get("", response_model=SuccessResponse[TaskListResponse])
+async def get_tasks(
+    member_id: Optional[str] = Query(None, description="Filter by assigned member ID"),
+    is_completed: Optional[bool] = Query(None, description="Filter by completion state"),
+    priority: Optional[str] = Query(None, description="urgent | normal | low"),
+    due_date: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    current_user: dict = Depends(require_household),
+    service: TaskService = Depends(TaskService),
+):
+    """
+    Get tasks with optional filters.
+    Used by: task board, home today tasks, kid mode task list.
+    """
+    result = await service.get_tasks(
+        current_user["household_id"],
+        member_id, is_completed, priority, due_date,
     )
-    if not result.data:
-        raise HTTPException(status_code=403, detail="Not a member of this household")
+    return SuccessResponse(data=result)
 
 
-@router.get("/{household_id}/tasks", response_model=list[TaskResponse])
-def list_tasks(household_id: str, user: CurrentUser):
-    db = get_supabase()
-    _assert_member(db, household_id, user["sub"])
+@router.get("/{task_id}", response_model=SuccessResponse[TaskResponse])
+async def get_task(
+    task_id: str,
+    current_user: dict = Depends(require_household),
+    service: TaskService = Depends(TaskService),
+):
+    """Get single task with subtasks and assigned member details."""
+    result = await service.get_task(task_id, current_user["household_id"])
+    return SuccessResponse(data=result)
 
-    result = (
-        db.table("tasks")
-        .select("*")
-        .eq("household_id", household_id)
-        .order("created_at", desc=True)
-        .execute()
+
+@router.post("", response_model=SuccessResponse[TaskResponse])
+async def create_task(
+    body: CreateTaskRequest,
+    current_user: dict = Depends(require_household),
+    service: TaskService = Depends(TaskService),
+):
+    """Create task. Broadcasts tasks:task_added via WebSocket."""
+    result = await service.create_task(
+        body, current_user["id"], current_user["household_id"]
     )
-    return result.data or []
+    return SuccessResponse(data=result)
 
 
-@router.post("/{household_id}/tasks", response_model=TaskResponse, status_code=status.HTTP_201_CREATED)
-def create_task(household_id: str, body: CreateTaskRequest, user: CurrentUser):
-    db = get_supabase()
-    _assert_member(db, household_id, user["sub"])
-
-    result = db.table("tasks").insert({
-        "household_id": household_id,
-        "title": body.title,
-        "description": body.description,
-        "due_date": body.due_date.isoformat() if body.due_date else None,
-        "assigned_to": body.assigned_to,
-        "points": body.points,
-        "completed": False,
-        "created_by": user["sub"],
-    }).execute()
-
-    if not result.data:
-        raise HTTPException(status_code=500, detail="Failed to create task")
-
-    task = result.data[0]
-
-    if body.assigned_to and body.assigned_to != user["sub"]:
-        member = (
-            db.table("household_members")
-            .select("fcm_token, display_name")
-            .eq("user_id", body.assigned_to)
-            .eq("household_id", household_id)
-            .maybe_single()
-            .execute()
-        )
-        if member.data and member.data.get("fcm_token"):
-            send_push_to_user(
-                token=member.data["fcm_token"],
-                title="New task assigned",
-                body=body.title,
-            )
-
-    return task
-
-
-@router.patch("/{household_id}/tasks/{task_id}", response_model=TaskResponse)
-def update_task(household_id: str, task_id: str, body: UpdateTaskRequest, user: CurrentUser):
-    db = get_supabase()
-    _assert_member(db, household_id, user["sub"])
-
-    existing = (
-        db.table("tasks")
-        .select("id")
-        .eq("id", task_id)
-        .eq("household_id", household_id)
-        .maybe_single()
-        .execute()
+@router.put("/{task_id}", response_model=SuccessResponse[TaskResponse])
+async def update_task(
+    task_id: str,
+    body: UpdateTaskRequest,
+    current_user: dict = Depends(require_household),
+    service: TaskService = Depends(TaskService),
+):
+    """Update task fields. Broadcasts tasks:task_updated via WebSocket."""
+    result = await service.update_task(
+        task_id, current_user["household_id"], body
     )
-    if not existing.data:
-        raise HTTPException(status_code=404, detail="Task not found")
-
-    updates = body.model_dump(exclude_none=True)
-    if updates.get("completed") is True:
-        updates["completed_at"] = datetime.now(timezone.utc).isoformat()
-        updates["completed_by"] = user["sub"]
-    if "due_date" in updates and updates["due_date"] is not None:
-        updates["due_date"] = updates["due_date"].isoformat()
-
-    result = db.table("tasks").update(updates).eq("id", task_id).execute()
-    return result.data[0]
+    return SuccessResponse(data=result)
 
 
-@router.delete("/{household_id}/tasks/{task_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_task(household_id: str, task_id: str, user: CurrentUser):
-    db = get_supabase()
-    _assert_member(db, household_id, user["sub"])
-
-    existing = (
-        db.table("tasks")
-        .select("id")
-        .eq("id", task_id)
-        .eq("household_id", household_id)
-        .maybe_single()
-        .execute()
+@router.post("/{task_id}/complete", response_model=SuccessResponse[TaskResponse])
+async def complete_task(
+    task_id: str,
+    current_user: dict = Depends(require_household),
+    service: TaskService = Depends(TaskService),
+):
+    """
+    Complete a task.
+    Awards XP to the assigned member if they are a child.
+    Broadcasts tasks:task_completed via WebSocket.
+    """
+    result = await service.complete_task(
+        task_id, current_user["household_id"], current_user["id"]
     )
-    if not existing.data:
-        raise HTTPException(status_code=404, detail="Task not found")
+    return SuccessResponse(data=result)
 
-    db.table("tasks").delete().eq("id", task_id).execute()
+
+@router.post("/{task_id}/uncomplete", response_model=SuccessResponse[TaskResponse])
+async def uncomplete_task(
+    task_id: str,
+    current_user: dict = Depends(require_household),
+    service: TaskService = Depends(TaskService),
+):
+    """Undo task completion. Broadcasts tasks:task_updated via WebSocket."""
+    result = await service.uncomplete_task(
+        task_id, current_user["household_id"]
+    )
+    return SuccessResponse(data=result)
+
+
+@router.delete("/{task_id}", response_model=MessageResponse)
+async def delete_task(
+    task_id: str,
+    current_user: dict = Depends(require_household),
+    service: TaskService = Depends(TaskService),
+):
+    """Delete task and cascade subtasks. Broadcasts tasks:task_deleted via WebSocket."""
+    await service.delete_task(task_id, current_user["household_id"])
+    return MessageResponse(message="Task deleted successfully")
+
+
+@router.post("/{task_id}/subtasks", response_model=SuccessResponse[SubtaskResponse])
+async def create_subtask(
+    task_id: str,
+    body: CreateSubtaskRequest,
+    current_user: dict = Depends(require_household),
+    service: TaskService = Depends(TaskService),
+):
+    """Add a subtask to a task."""
+    result = await service.create_subtask(
+        task_id, current_user["household_id"], body
+    )
+    return SuccessResponse(data=result)
+
+
+@router.put("/{task_id}/subtasks/{subtask_id}", response_model=SuccessResponse[SubtaskResponse])
+async def update_subtask(
+    task_id: str,
+    subtask_id: str,
+    body: UpdateSubtaskRequest,
+    current_user: dict = Depends(require_household),
+    service: TaskService = Depends(TaskService),
+):
+    """Toggle subtask completion or rename it."""
+    result = await service.update_subtask(
+        task_id, subtask_id, current_user["household_id"], body
+    )
+    return SuccessResponse(data=result)
+
+
+@router.delete("/{task_id}/subtasks/{subtask_id}", response_model=MessageResponse)
+async def delete_subtask(
+    task_id: str,
+    subtask_id: str,
+    current_user: dict = Depends(require_household),
+    service: TaskService = Depends(TaskService),
+):
+    """Delete a subtask."""
+    await service.delete_subtask(
+        task_id, subtask_id, current_user["household_id"]
+    )
+    return MessageResponse(message="Subtask deleted")

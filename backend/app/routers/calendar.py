@@ -1,124 +1,138 @@
-from datetime import datetime, timezone
+"""
+Calendar Router — /calendar prefix
+All endpoints require authentication + household membership.
+No WebSocket broadcasts — Flutter refetches after mutations.
+"""
+
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Query
 
-from ..auth import CurrentUser
-from ..database import get_supabase
-from ..models.calendar import (
-    CalendarEventResponse,
+from app.core.dependencies import require_household
+from app.schemas.calendar import (
+    AddEventMembersRequest,
     CreateEventRequest,
+    EventListResponse,
+    EventResponse,
     UpdateEventRequest,
 )
+from app.schemas.common import MessageResponse, SuccessResponse
+from app.services.calendar_service import CalendarService
 
 router = APIRouter(prefix="/calendar", tags=["calendar"])
 
 
-def _assert_member(db, household_id: str, user_id: str):
-    result = (
-        db.table("household_members")
-        .select("id")
-        .eq("household_id", household_id)
-        .eq("user_id", user_id)
-        .maybe_single()
-        .execute()
-    )
-    if not result.data:
-        raise HTTPException(status_code=403, detail="Not a member of this household")
-
-
-@router.get("/{household_id}/events", response_model=list[CalendarEventResponse])
-def list_events(
-    household_id: str,
-    user: CurrentUser,
-    from_date: Optional[datetime] = Query(None),
-    to_date: Optional[datetime] = Query(None),
+@router.get("", response_model=SuccessResponse[EventListResponse])
+async def get_events(
+    date_from: Optional[str] = Query(None, description="ISO datetime e.g. 2026-03-01T00:00:00"),
+    date_to: Optional[str] = Query(None, description="ISO datetime e.g. 2026-04-01T00:00:00"),
+    member_id: Optional[str] = Query(None, description="Filter events by member ID"),
+    current_user: dict = Depends(require_household),
+    service: CalendarService = Depends(CalendarService),
 ):
-    db = get_supabase()
-    _assert_member(db, household_id, user["sub"])
-
-    query = db.table("calendar_events").select("*").eq("household_id", household_id)
-    if from_date:
-        query = query.gte("start_time", from_date.isoformat())
-    if to_date:
-        query = query.lte("start_time", to_date.isoformat())
-
-    result = query.order("start_time").execute()
-    return result.data or []
+    """
+    Get household events within a date range.
+    Used by: monthly grid, home week strip, upcoming events section.
+    """
+    result = await service.get_events(
+        current_user["household_id"], date_from, date_to, member_id
+    )
+    return SuccessResponse(data=result)
 
 
-@router.post("/{household_id}/events", response_model=CalendarEventResponse, status_code=status.HTTP_201_CREATED)
-def create_event(household_id: str, body: CreateEventRequest, user: CurrentUser):
-    db = get_supabase()
-    _assert_member(db, household_id, user["sub"])
-
-    result = db.table("calendar_events").insert({
-        "household_id": household_id,
-        "title": body.title,
-        "description": body.description,
-        "start_time": body.start_time.isoformat(),
-        "end_time": body.end_time.isoformat() if body.end_time else None,
-        "is_all_day": body.is_all_day,
-        "assigned_to": body.assigned_to,
-        "color": body.color,
-        "created_by": user["sub"],
-    }).execute()
-
-    if not result.data:
-        raise HTTPException(status_code=500, detail="Failed to create event")
-    return result.data[0]
+@router.get("/day", response_model=SuccessResponse[EventListResponse])
+async def get_day_events(
+    date: str = Query(..., description="Date in YYYY-MM-DD format"),
+    current_user: dict = Depends(require_household),
+    service: CalendarService = Depends(CalendarService),
+):
+    """
+    Get all events for a specific day ordered by start_time.
+    Used by: calendar timeline view, home screen today panel.
+    """
+    result = await service.get_day_events(current_user["household_id"], date)
+    return SuccessResponse(data=result)
 
 
-@router.patch("/{household_id}/events/{event_id}", response_model=CalendarEventResponse)
-def update_event(
-    household_id: str,
+@router.get("/{event_id}", response_model=SuccessResponse[EventResponse])
+async def get_event(
+    event_id: str,
+    current_user: dict = Depends(require_household),
+    service: CalendarService = Depends(CalendarService),
+):
+    """Get a single event with full member details."""
+    result = await service.get_event(event_id, current_user["household_id"])
+    return SuccessResponse(data=result)
+
+
+@router.post("", response_model=SuccessResponse[EventResponse])
+async def create_event(
+    body: CreateEventRequest,
+    current_user: dict = Depends(require_household),
+    service: CalendarService = Depends(CalendarService),
+):
+    """
+    Create a new calendar event.
+    Creator is automatically added to members even if not in member_ids.
+    """
+    result = await service.create_event(
+        body, current_user["id"], current_user["household_id"]
+    )
+    return SuccessResponse(data=result)
+
+
+@router.put("/{event_id}", response_model=SuccessResponse[EventResponse])
+async def update_event(
     event_id: str,
     body: UpdateEventRequest,
-    user: CurrentUser,
+    current_user: dict = Depends(require_household),
+    service: CalendarService = Depends(CalendarService),
 ):
-    db = get_supabase()
-    _assert_member(db, household_id, user["sub"])
-
-    existing = (
-        db.table("calendar_events")
-        .select("id")
-        .eq("id", event_id)
-        .eq("household_id", household_id)
-        .maybe_single()
-        .execute()
+    """
+    Update event fields.
+    Passing member_ids replaces the full member list.
+    Omit member_ids to leave members unchanged.
+    """
+    result = await service.update_event(
+        event_id, current_user["household_id"], body
     )
-    if not existing.data:
-        raise HTTPException(status_code=404, detail="Event not found")
+    return SuccessResponse(data=result)
 
-    updates = body.model_dump(exclude_none=True)
-    if "start_time" in updates:
-        updates["start_time"] = updates["start_time"].isoformat()
-    if "end_time" in updates:
-        updates["end_time"] = updates["end_time"].isoformat()
 
-    result = (
-        db.table("calendar_events")
-        .update(updates)
-        .eq("id", event_id)
-        .execute()
+@router.delete("/{event_id}", response_model=MessageResponse)
+async def delete_event(
+    event_id: str,
+    current_user: dict = Depends(require_household),
+    service: CalendarService = Depends(CalendarService),
+):
+    """Delete event. Cascades to event_members automatically."""
+    await service.delete_event(event_id, current_user["household_id"])
+    return MessageResponse(message="Event deleted successfully")
+
+
+@router.post("/{event_id}/members", response_model=SuccessResponse[EventResponse])
+async def add_event_members(
+    event_id: str,
+    body: AddEventMembersRequest,
+    current_user: dict = Depends(require_household),
+    service: CalendarService = Depends(CalendarService),
+):
+    """Add one or more members to an existing event."""
+    result = await service.add_event_members(
+        event_id, current_user["household_id"], body
     )
-    return result.data[0]
+    return SuccessResponse(data=result)
 
 
-@router.delete("/{household_id}/events/{event_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_event(household_id: str, event_id: str, user: CurrentUser):
-    db = get_supabase()
-    _assert_member(db, household_id, user["sub"])
-
-    existing = (
-        db.table("calendar_events")
-        .select("id, created_by")
-        .eq("id", event_id)
-        .eq("household_id", household_id)
-        .maybe_single()
-        .execute()
+@router.delete("/{event_id}/members/{member_id}", response_model=SuccessResponse[EventResponse])
+async def remove_event_member(
+    event_id: str,
+    member_id: str,
+    current_user: dict = Depends(require_household),
+    service: CalendarService = Depends(CalendarService),
+):
+    """Remove a single member from an event."""
+    result = await service.remove_event_member(
+        event_id, current_user["household_id"], member_id
     )
-    if not existing.data:
-        raise HTTPException(status_code=404, detail="Event not found")
-
-    db.table("calendar_events").delete().eq("id", event_id).execute()
+    return SuccessResponse(data=result)

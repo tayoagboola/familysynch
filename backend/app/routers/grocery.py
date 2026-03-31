@@ -1,113 +1,118 @@
-from fastapi import APIRouter, HTTPException, status
-from pydantic import BaseModel
+"""
+Grocery Router — /grocery prefix
+All endpoints require authentication + household membership.
+WebSocket broadcasts happen inside service layer on every mutation.
+IMPORTANT: DELETE /checked must be registered BEFORE DELETE /{item_id}
+to avoid FastAPI treating "checked" as an item_id path parameter.
+"""
+
 from typing import Optional
 
-from ..auth import CurrentUser
-from ..database import get_supabase
+from fastapi import APIRouter, Depends, Query
+
+from app.core.dependencies import require_household
+from app.schemas.common import MessageResponse, SuccessResponse
+from app.schemas.grocery import (
+    AddGroceryItemRequest,
+    BatchSyncRequest,
+    BatchSyncResponse,
+    GroceryItemResponse,
+    GroceryListResponse,
+    UpdateGroceryItemRequest,
+)
+from app.services.grocery_service import GroceryService
 
 router = APIRouter(prefix="/grocery", tags=["grocery"])
 
 
-class GroceryItemRequest(BaseModel):
-    name: str
-    quantity: Optional[str] = None
-    category: Optional[str] = None
-    added_by: Optional[str] = None
-
-
-class GroceryItemResponse(BaseModel):
-    id: str
-    household_id: str
-    name: str
-    quantity: Optional[str] = None
-    category: Optional[str] = None
-    checked: bool
-    added_by: str
-    checked_by: Optional[str] = None
-
-
-def _assert_member(db, household_id: str, user_id: str):
-    result = (
-        db.table("household_members")
-        .select("id")
-        .eq("household_id", household_id)
-        .eq("user_id", user_id)
-        .maybe_single()
-        .execute()
+@router.get("", response_model=SuccessResponse[GroceryListResponse])
+async def get_items(
+    category: Optional[str] = Query(None, description="dairy|produce|meat|care|bakery|frozen|drinks|other"),
+    is_checked: Optional[bool] = Query(None, description="Filter by checked state"),
+    current_user: dict = Depends(require_household),
+    service: GroceryService = Depends(GroceryService),
+):
+    """Get all grocery items. Unchecked first, then checked."""
+    result = await service.get_items(
+        current_user["household_id"], category, is_checked
     )
-    if not result.data:
-        raise HTTPException(status_code=403, detail="Not a member of this household")
+    return SuccessResponse(data=result)
 
 
-@router.get("/{household_id}/items", response_model=list[GroceryItemResponse])
-def list_items(household_id: str, user: CurrentUser):
-    db = get_supabase()
-    _assert_member(db, household_id, user["sub"])
-
-    result = (
-        db.table("grocery_items")
-        .select("*")
-        .eq("household_id", household_id)
-        .order("category")
-        .execute()
+@router.post("", response_model=SuccessResponse[GroceryItemResponse])
+async def add_item(
+    body: AddGroceryItemRequest,
+    current_user: dict = Depends(require_household),
+    service: GroceryService = Depends(GroceryService),
+):
+    """Add item. Category inferred from name if not provided."""
+    result = await service.add_item(
+        body, current_user["id"], current_user["household_id"]
     )
-    return result.data or []
+    return SuccessResponse(data=result)
 
 
-@router.post("/{household_id}/items", response_model=GroceryItemResponse, status_code=status.HTTP_201_CREATED)
-def add_item(household_id: str, body: GroceryItemRequest, user: CurrentUser):
-    db = get_supabase()
-    _assert_member(db, household_id, user["sub"])
-
-    result = db.table("grocery_items").insert({
-        "household_id": household_id,
-        "name": body.name,
-        "quantity": body.quantity,
-        "category": body.category,
-        "checked": False,
-        "added_by": user["sub"],
-    }).execute()
-
-    if not result.data:
-        raise HTTPException(status_code=500, detail="Failed to add item")
-    return result.data[0]
-
-
-@router.patch("/{household_id}/items/{item_id}/check", response_model=GroceryItemResponse)
-def toggle_check(household_id: str, item_id: str, user: CurrentUser):
-    db = get_supabase()
-    _assert_member(db, household_id, user["sub"])
-
-    existing = (
-        db.table("grocery_items")
-        .select("id, checked")
-        .eq("id", item_id)
-        .eq("household_id", household_id)
-        .maybe_single()
-        .execute()
+@router.post("/sync", response_model=SuccessResponse[BatchSyncResponse])
+async def batch_sync(
+    body: BatchSyncRequest,
+    current_user: dict = Depends(require_household),
+    service: GroceryService = Depends(GroceryService),
+):
+    """
+    Offline sync — Flutter calls this on reconnect.
+    Sends Isar pending queue → returns local_id to server_id mapping.
+    Idempotent via local_id — safe to call multiple times.
+    """
+    result = await service.batch_sync(
+        body, current_user["id"], current_user["household_id"]
     )
-    if not existing.data:
-        raise HTTPException(status_code=404, detail="Item not found")
-
-    checked = not existing.data["checked"]
-    result = db.table("grocery_items").update({
-        "checked": checked,
-        "checked_by": user["sub"] if checked else None,
-    }).eq("id", item_id).execute()
-    return result.data[0]
+    return SuccessResponse(data=result)
 
 
-@router.delete("/{household_id}/items/{item_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_item(household_id: str, item_id: str, user: CurrentUser):
-    db = get_supabase()
-    _assert_member(db, household_id, user["sub"])
+@router.delete("/checked", response_model=SuccessResponse[GroceryListResponse])
+async def clear_checked(
+    current_user: dict = Depends(require_household),
+    service: GroceryService = Depends(GroceryService),
+):
+    """
+    Delete all checked items at once.
+    Registered before DELETE /{item_id} to avoid route conflict.
+    """
+    result = await service.clear_checked(current_user["household_id"])
+    return SuccessResponse(data=result)
 
-    db.table("grocery_items").delete().eq("id", item_id).eq("household_id", household_id).execute()
+
+@router.put("/{item_id}", response_model=SuccessResponse[GroceryItemResponse])
+async def update_item(
+    item_id: str,
+    body: UpdateGroceryItemRequest,
+    current_user: dict = Depends(require_household),
+    service: GroceryService = Depends(GroceryService),
+):
+    """Update item details. Category re-inferred if name changes."""
+    result = await service.update_item(
+        item_id, current_user["household_id"], body
+    )
+    return SuccessResponse(data=result)
 
 
-@router.delete("/{household_id}/items/checked", status_code=status.HTTP_204_NO_CONTENT)
-def clear_checked(household_id: str, user: CurrentUser):
-    db = get_supabase()
-    _assert_member(db, household_id, user["sub"])
+@router.post("/{item_id}/toggle", response_model=SuccessResponse[GroceryItemResponse])
+async def toggle_item(
+    item_id: str,
+    current_user: dict = Depends(require_household),
+    service: GroceryService = Depends(GroceryService),
+):
+    """Toggle item checked state. Idempotent."""
+    result = await service.toggle_item(item_id, current_user["household_id"])
+    return SuccessResponse(data=result)
 
-    db.table("grocery_items").delete().eq("household_id", household_id).eq("checked", True).execute()
+
+@router.delete("/{item_id}", response_model=MessageResponse)
+async def delete_item(
+    item_id: str,
+    current_user: dict = Depends(require_household),
+    service: GroceryService = Depends(GroceryService),
+):
+    """Delete single item."""
+    await service.delete_item(item_id, current_user["household_id"])
+    return MessageResponse(message="Item deleted")

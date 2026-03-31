@@ -1,29 +1,43 @@
-from fastapi import APIRouter, HTTPException, status
-from pydantic import BaseModel
+"""
+Notification Router — /notifications prefix
+Flutter uses this to register/unregister FCM tokens.
+Actual push dispatch is internal — called by other services.
+"""
 
-from ..auth import CurrentUser
-from ..database import get_supabase
+from fastapi import APIRouter, Depends
+
+from app.core.dependencies import require_household
+from app.schemas.common import MessageResponse
+from app.schemas.notifications import RegisterTokenRequest
+from app.services.notification_service import NotificationService
 
 router = APIRouter(prefix="/notifications", tags=["notifications"])
 
 
-class RegisterTokenRequest(BaseModel):
-    fcm_token: str
+@router.post("/register", response_model=MessageResponse)
+async def register_token(
+    body: RegisterTokenRequest,
+    current_user: dict = Depends(require_household),
+    service: NotificationService = Depends(NotificationService),
+):
+    """
+    Register FCM token for this device.
+    Flutter calls this after login and whenever FCM token refreshes.
+    Safe to call multiple times — upsert on (member_id, fcm_token).
+    """
+    await service.register_token(body, current_user["id"])
+    return MessageResponse(message="Token registered")
 
 
-@router.post("/register-token", status_code=status.HTTP_204_NO_CONTENT)
-def register_fcm_token(body: RegisterTokenRequest, user: CurrentUser):
-    db = get_supabase()
-    result = (
-        db.table("household_members")
-        .select("id")
-        .eq("user_id", user["sub"])
-        .maybe_single()
-        .execute()
-    )
-    if not result.data:
-        raise HTTPException(status_code=404, detail="Member record not found")
-
-    db.table("household_members").update({
-        "fcm_token": body.fcm_token
-    }).eq("user_id", user["sub"]).execute()
+@router.delete("/register", response_model=MessageResponse)
+async def unregister_token(
+    body: RegisterTokenRequest,
+    current_user: dict = Depends(require_household),
+    service: NotificationService = Depends(NotificationService),
+):
+    """
+    Unregister FCM token on logout or app uninstall.
+    Flutter calls this before logout.
+    """
+    await service.unregister_token(body.fcm_token, current_user["id"])
+    return MessageResponse(message="Token unregistered")

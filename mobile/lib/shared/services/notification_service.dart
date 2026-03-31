@@ -1,7 +1,11 @@
+/// NotificationService — FCM token registration and push handling.
+
 import 'dart:io';
 
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:familysynch/shared/services/api_client.dart';
 
 // Top-level handler for background/terminated messages (required by FCM).
 @pragma('vm:entry-point')
@@ -10,10 +14,12 @@ Future<void> firebaseMessagingBackgroundHandler(RemoteMessage message) async {
   // On iOS the system handles them. Nothing extra needed here.
 }
 
-class NotificationService {
-  NotificationService._();
-  static final NotificationService instance = NotificationService._();
+final notificationServiceProvider = Provider<NotificationService>((ref) {
+  return NotificationService(ref.read(apiClientProvider));
+});
 
+class NotificationService {
+  final ApiClient _api;
   final _fcm = FirebaseMessaging.instance;
   final _localNotifications = FlutterLocalNotificationsPlugin();
 
@@ -24,19 +30,16 @@ class NotificationService {
     importance: Importance.high,
   );
 
-  /// Call once from main() after Firebase.initializeApp().
-  Future<void> init() async {
-    // Register background handler.
+  NotificationService(this._api);
+
+  Future<void> initialize() async {
+    // Register background handler
     FirebaseMessaging.onBackgroundMessage(firebaseMessagingBackgroundHandler);
 
-    // Request permission (iOS / web).
-    await _fcm.requestPermission(
-      alert: true,
-      badge: true,
-      sound: true,
-    );
+    // Request permission
+    await _fcm.requestPermission(alert: true, badge: true, sound: true);
 
-    // Android: create notification channel.
+    // Android: create notification channel
     if (Platform.isAndroid) {
       await _localNotifications
           .resolvePlatformSpecificImplementation<
@@ -44,29 +47,53 @@ class NotificationService {
           ?.createNotificationChannel(_androidChannel);
     }
 
-    // Initialise flutter_local_notifications.
+    // Initialize local notifications
     const initSettings = InitializationSettings(
       android: AndroidInitializationSettings('@mipmap/ic_launcher'),
       iOS: DarwinInitializationSettings(),
     );
     await _localNotifications.initialize(initSettings);
 
-    // Show local notification when app is in foreground.
-    FirebaseMessaging.onMessage.listen(_onForegroundMessage);
-
-    // iOS: show foreground notifications.
+    // iOS: show foreground notifications
     await _fcm.setForegroundNotificationPresentationOptions(
       alert: true,
       badge: true,
       sound: true,
     );
+
+    // Register token
+    final token = await _fcm.getToken();
+    if (token != null) await registerToken(token);
+
+    // Refresh handler
+    _fcm.onTokenRefresh.listen(registerToken);
+
+    // Foreground message handler — show local notification
+    FirebaseMessaging.onMessage.listen(_showLocalNotification);
+  }
+
+  Future<void> registerToken(String token) async {
+    try {
+      await _api.post('/notifications/register', body: {
+        'fcm_token': token,
+        'device_platform': Platform.isIOS ? 'ios' : 'android',
+      });
+    } catch (_) {}
+  }
+
+  Future<void> unregisterToken() async {
+    final token = await _fcm.getToken();
+    if (token == null) return;
+    try {
+      await _api.delete('/notifications/register', body: {
+        'fcm_token': token,
+        'device_platform': Platform.isIOS ? 'ios' : 'android',
+      });
+    } catch (_) {}
   }
 
   /// Returns the FCM registration token, or null if unavailable.
   Future<String?> getToken() => _fcm.getToken();
-
-  /// Stream that fires when the token is refreshed.
-  Stream<String> get onTokenRefresh => _fcm.onTokenRefresh;
 
   /// Stream of messages that opened the app from background.
   Stream<RemoteMessage> get onMessageOpenedApp =>
@@ -75,11 +102,11 @@ class NotificationService {
   /// The message that launched the app from terminated state, if any.
   Future<RemoteMessage?> get initialMessage => _fcm.getInitialMessage();
 
-  void _onForegroundMessage(RemoteMessage message) {
+  Future<void> _showLocalNotification(RemoteMessage message) async {
     final notification = message.notification;
     if (notification == null) return;
 
-    _localNotifications.show(
+    await _localNotifications.show(
       notification.hashCode,
       notification.title,
       notification.body,
@@ -94,6 +121,7 @@ class NotificationService {
         ),
         iOS: const DarwinNotificationDetails(),
       ),
+      payload: message.data.toString(),
     );
   }
 }

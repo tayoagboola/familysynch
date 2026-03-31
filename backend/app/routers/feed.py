@@ -1,89 +1,93 @@
-from fastapi import APIRouter, HTTPException, status
-from pydantic import BaseModel
+"""
+Feed Router — /feed prefix
+All endpoints require authentication + household membership.
+WebSocket broadcasts happen inside service layer on every mutation.
+"""
+
 from typing import Optional
 
-from ..auth import CurrentUser
-from ..database import get_supabase
+from fastapi import APIRouter, Depends, Query
+
+from app.core.dependencies import require_household
+from app.schemas.common import MessageResponse, SuccessResponse
+from app.schemas.feed import (
+    CreatePostRequest,
+    FeedResponse,
+    PostResponse,
+    ReactRequest,
+)
+from app.services.feed_service import FeedService
 
 router = APIRouter(prefix="/feed", tags=["feed"])
 
 
-class CreatePostRequest(BaseModel):
-    content: str
-    image_url: Optional[str] = None
-
-
-class FeedPostResponse(BaseModel):
-    id: str
-    household_id: str
-    content: str
-    image_url: Optional[str] = None
-    author_id: str
-    created_at: str
-
-
-def _assert_member(db, household_id: str, user_id: str):
-    result = (
-        db.table("household_members")
-        .select("id")
-        .eq("household_id", household_id)
-        .eq("user_id", user_id)
-        .maybe_single()
-        .execute()
+@router.get("", response_model=SuccessResponse[FeedResponse])
+async def get_feed(
+    type: Optional[str] = Query(None, description="message|announcement|achievement|update"),
+    cursor: Optional[str] = Query(None, description="created_at of last post for next page"),
+    limit: int = Query(20, ge=1, le=50),
+    current_user: dict = Depends(require_household),
+    service: FeedService = Depends(FeedService),
+):
+    """
+    Paginated feed. Newest first.
+    Pass cursor to load older posts (infinite scroll).
+    reactions include reacted_by_me based on current user.
+    """
+    result = await service.get_feed(
+        current_user["household_id"],
+        current_user["id"],
+        post_type=type,
+        cursor=cursor,
+        limit=limit,
     )
-    if not result.data:
-        raise HTTPException(status_code=403, detail="Not a member of this household")
+    return SuccessResponse(data=result)
 
 
-@router.get("/{household_id}/posts", response_model=list[FeedPostResponse])
-def list_posts(household_id: str, user: CurrentUser):
-    db = get_supabase()
-    _assert_member(db, household_id, user["sub"])
-
-    result = (
-        db.table("feed_posts")
-        .select("*")
-        .eq("household_id", household_id)
-        .order("created_at", desc=True)
-        .limit(50)
-        .execute()
+@router.post("", response_model=SuccessResponse[PostResponse])
+async def create_post(
+    body: CreatePostRequest,
+    current_user: dict = Depends(require_household),
+    service: FeedService = Depends(FeedService),
+):
+    """
+    Create post. Supports text, event shares, achievements.
+    Broadcasts feed:post_added to all household WebSocket clients.
+    """
+    result = await service.create_post(
+        body, current_user["id"], current_user["household_id"]
     )
-    return result.data or []
+    return SuccessResponse(data=result)
 
 
-@router.post("/{household_id}/posts", response_model=FeedPostResponse, status_code=status.HTTP_201_CREATED)
-def create_post(household_id: str, body: CreatePostRequest, user: CurrentUser):
-    db = get_supabase()
-    _assert_member(db, household_id, user["sub"])
-
-    result = db.table("feed_posts").insert({
-        "household_id": household_id,
-        "content": body.content,
-        "image_url": body.image_url,
-        "author_id": user["sub"],
-    }).execute()
-
-    if not result.data:
-        raise HTTPException(status_code=500, detail="Failed to create post")
-    return result.data[0]
-
-
-@router.delete("/{household_id}/posts/{post_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_post(household_id: str, post_id: str, user: CurrentUser):
-    db = get_supabase()
-    _assert_member(db, household_id, user["sub"])
-
-    existing = (
-        db.table("feed_posts")
-        .select("id, author_id")
-        .eq("id", post_id)
-        .eq("household_id", household_id)
-        .maybe_single()
-        .execute()
+@router.delete("/{post_id}", response_model=MessageResponse)
+async def delete_post(
+    post_id: str,
+    current_user: dict = Depends(require_household),
+    service: FeedService = Depends(FeedService),
+):
+    """
+    Delete post. Author or parent only.
+    Reactions cascade delete. Broadcasts feed:post_deleted.
+    """
+    await service.delete_post(
+        post_id, current_user["household_id"], current_user["id"]
     )
-    if not existing.data:
-        raise HTTPException(status_code=404, detail="Post not found")
-    if existing.data["author_id"] != user["sub"]:
-        raise HTTPException(status_code=403, detail="Cannot delete another member's post")
+    return MessageResponse(message="Post deleted")
 
-    db.table("feed_posts").delete().eq("id", post_id).execute()
+
+@router.post("/{post_id}/react", response_model=SuccessResponse[PostResponse])
+async def toggle_reaction(
+    post_id: str,
+    body: ReactRequest,
+    current_user: dict = Depends(require_household),
+    service: FeedService = Depends(FeedService),
+):
+    """
+    Toggle emoji reaction. Already reacted → removes. Not reacted → adds.
+    Broadcasts feed:reaction_added or feed:reaction_removed.
+    """
+    result = await service.toggle_reaction(
+        post_id, current_user["household_id"], current_user["id"], body
+    )
+    return SuccessResponse(data=result)
