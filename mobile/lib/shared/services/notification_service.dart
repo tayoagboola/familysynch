@@ -19,6 +19,8 @@ final notificationServiceProvider = Provider<NotificationService>((ref) {
 });
 
 class NotificationService {
+  static final NotificationService instance = NotificationService(ApiClient());
+
   final ApiClient _api;
   final _fcm = FirebaseMessaging.instance;
   final _localNotifications = FlutterLocalNotificationsPlugin();
@@ -31,6 +33,8 @@ class NotificationService {
   );
 
   NotificationService(this._api);
+
+  Future<void> init() => initialize();
 
   Future<void> initialize() async {
     // Register background handler
@@ -94,6 +98,8 @@ class NotificationService {
 
   /// Returns the FCM registration token, or null if unavailable.
   Future<String?> getToken() => _fcm.getToken();
+
+  Stream<String> get onTokenRefresh => _fcm.onTokenRefresh;
 
   /// Stream of messages that opened the app from background.
   Stream<RemoteMessage> get onMessageOpenedApp =>

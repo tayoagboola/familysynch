@@ -1,5 +1,6 @@
 import '../../domain/entities/calendar_event.dart';
 import '../../domain/repositories/calendar_repository.dart';
+import '../models/calendar_event_model.dart';
 import '../datasources/remote/calendar_remote_datasource.dart';
 
 class CalendarRepositoryImpl implements CalendarRepository {

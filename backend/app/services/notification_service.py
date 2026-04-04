@@ -26,6 +26,7 @@ Rules:
 """
 
 import json
+import logging
 
 from fastapi import Depends
 from supabase import Client
@@ -40,15 +41,37 @@ from app.schemas.notifications import (
     RegisterTokenRequest,
 )
 
+logger = logging.getLogger(__name__)
+
+_firebase_enabled = False
 
 # ── Firebase Initialization ───────────────────────────────────────────────────
 
 def _init_firebase():
     """Initialize Firebase Admin SDK from JSON credentials in env var."""
-    if not firebase_admin._apps:
-        cred_dict = json.loads(settings.firebase_credentials_json)
+    global _firebase_enabled
+
+    if firebase_admin._apps:
+        _firebase_enabled = True
+        return
+
+    raw_credentials = settings.firebase_credentials_json.strip()
+    if not raw_credentials:
+        logger.warning(
+            "Firebase credentials not configured; push notifications disabled."
+        )
+        return
+
+    try:
+        cred_dict = json.loads(raw_credentials)
         cred = credentials.Certificate(cred_dict)
         firebase_admin.initialize_app(cred)
+        _firebase_enabled = True
+    except (json.JSONDecodeError, ValueError, TypeError) as exc:
+        logger.warning(
+            "Invalid Firebase credentials; push notifications disabled: %s",
+            exc,
+        )
 
 _init_firebase()
 
@@ -217,6 +240,9 @@ class NotificationService:
         Invalid tokens are removed from device_tokens table.
         Never raises — errors are handled gracefully.
         """
+        if not _firebase_enabled:
+            return NotificationSentResponse(sent=0, failed=0)
+
         if not token_records:
             return NotificationSentResponse(sent=0, failed=0)
 

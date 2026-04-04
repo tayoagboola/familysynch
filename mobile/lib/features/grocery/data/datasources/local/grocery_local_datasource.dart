@@ -1,5 +1,4 @@
-import 'package:isar/isar.dart';
-import 'package:path_provider/path_provider.dart';
+import 'dart:async';
 
 import '../../models/grocery_item_local.dart';
 
@@ -7,74 +6,96 @@ class GroceryLocalDatasource {
   GroceryLocalDatasource._();
 
   static GroceryLocalDatasource? _instance;
-  static Isar? _isar;
+  final Map<String, List<GroceryItemLocal>> _itemsByHousehold = {};
+  final StreamController<void> _changes = StreamController<void>.broadcast();
 
   static Future<GroceryLocalDatasource> getInstance() async {
     _instance ??= GroceryLocalDatasource._();
-    if (_isar == null || !_isar!.isOpen) {
-      final dir = await getApplicationDocumentsDirectory();
-      _isar = await Isar.open(
-        [GroceryItemLocalSchema],
-        directory: dir.path,
-      );
-    }
     return _instance!;
   }
 
-  Isar get _db => _isar!;
-
-  Stream<List<GroceryItemLocal>> watchItems(String householdId) {
-    return _db.groceryItemLocals
-        .filter()
-        .householdIdEqualTo(householdId)
-        .sortByCategory()
-        .thenByName()
-        .watch(fireImmediately: true);
+  Stream<List<GroceryItemLocal>> watchItems(String householdId) async* {
+    yield _sortedItems(householdId);
+    yield* _changes.stream.map((_) => _sortedItems(householdId));
   }
 
   Future<List<GroceryItemLocal>> getItems(String householdId) {
-    return _db.groceryItemLocals
-        .filter()
-        .householdIdEqualTo(householdId)
-        .sortByCategory()
-        .thenByName()
-        .findAll();
+    if (householdId.isEmpty) {
+      return Future.value(
+        _itemsByHousehold.values
+            .expand((items) => items)
+            .toList(growable: false),
+      );
+    }
+    return Future.value(_sortedItems(householdId));
   }
 
   Future<void> putItem(GroceryItemLocal item) async {
-    await _db.writeTxn(() => _db.groceryItemLocals.put(item));
+    final items = _itemsByHousehold.putIfAbsent(
+      item.householdId,
+      () => <GroceryItemLocal>[],
+    );
+    final index = items.indexWhere((existing) => existing.id == item.id);
+    if (index >= 0) {
+      items[index] = item;
+    } else {
+      items.add(item);
+    }
+    _emitChange();
   }
 
   Future<void> putAll(List<GroceryItemLocal> items) async {
-    await _db.writeTxn(() => _db.groceryItemLocals.putAll(items));
+    for (final item in items) {
+      await putItem(item);
+    }
   }
 
   Future<void> deleteItem(String id) async {
-    await _db.writeTxn(
-        () => _db.groceryItemLocals.delete(fastHash(id)));
+    var changed = false;
+    for (final items in _itemsByHousehold.values) {
+      final originalLength = items.length;
+      items.removeWhere((item) => item.id == id);
+      if (items.length != originalLength) {
+        changed = true;
+      }
+    }
+    if (changed) {
+      _emitChange();
+    }
   }
 
   Future<void> deleteChecked(String householdId) async {
-    final checked = await _db.groceryItemLocals
-        .filter()
-        .householdIdEqualTo(householdId)
-        .checkedEqualTo(true)
-        .findAll();
-    final ids = checked.map((e) => e.isarId).toList();
-    await _db.writeTxn(() => _db.groceryItemLocals.deleteAll(ids));
+    final items = _itemsByHousehold[householdId];
+    if (items == null) return;
+    items.removeWhere((item) => item.checked);
+    _emitChange();
   }
 
   Future<void> replaceAll(
-      String householdId, List<GroceryItemLocal> items) async {
-    await _db.writeTxn(() async {
-      // Remove all items for this household then insert fresh
-      final existing = await _db.groceryItemLocals
-          .filter()
-          .householdIdEqualTo(householdId)
-          .findAll();
-      await _db.groceryItemLocals
-          .deleteAll(existing.map((e) => e.isarId).toList());
-      await _db.groceryItemLocals.putAll(items);
+    String householdId,
+    List<GroceryItemLocal> items,
+  ) async {
+    _itemsByHousehold[householdId] = List<GroceryItemLocal>.from(items);
+    _emitChange();
+  }
+
+  List<GroceryItemLocal> _sortedItems(String householdId) {
+    final items = List<GroceryItemLocal>.from(
+      _itemsByHousehold[householdId] ?? const <GroceryItemLocal>[],
+    );
+    items.sort((a, b) {
+      final categoryCompare = (a.category ?? '').compareTo(b.category ?? '');
+      if (categoryCompare != 0) {
+        return categoryCompare;
+      }
+      return a.name.compareTo(b.name);
     });
+    return items;
+  }
+
+  void _emitChange() {
+    if (!_changes.isClosed) {
+      _changes.add(null);
+    }
   }
 }
